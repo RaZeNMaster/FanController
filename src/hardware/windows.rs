@@ -101,12 +101,18 @@ impl Ring0 {
     fn open() -> Option<Self> {
         // 1. Already installed by LibreHardwareMonitor or previous run
         if let Some(r) = Self::open_device(w!("\\\\.\\WinRing0_1_2_0")) {
+            eprintln!("[Ring0] Opened existing \\\\.\\WinRing0_1_2_0 device.");
             return Some(r);
         }
+        eprintln!("[Ring0] Device not open yet — attempting to install driver ({} bytes embedded)...",
+            WINRING0_DRIVER.len());
         // 2. Try installing from a driver file next to the exe
         if let Some(r) = Self::install_and_open() {
+            eprintln!("[Ring0] Installed and opened WinRing0 driver.");
             return Some(r);
         }
+        eprintln!("[Ring0] FAILED to open WinRing0 driver. Fan control unavailable \
+                   (need Administrator; on Win11 HVCI/Memory-Integrity blocks unsigned WinRing0).");
         None
     }
 
@@ -226,7 +232,7 @@ impl Drop for Ring0 {
 // SUPERIO CHIP DETECTION AND REGISTER ACCESS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ChipFamily { Nuvoton, Nct6687, Ite, Fintek }
 
 #[derive(Clone)]
@@ -717,6 +723,53 @@ impl SystemFanBackend {
             ChipFamily::Fintek  => Fintek::read_pwm(r, c.iobase, fan),
         }
     }
+}
+
+/// Standalone hardware diagnostics for the `--diag` CLI flag.
+/// Run from an **elevated** terminal: `fancontroller.exe --diag`
+/// Prints exactly where SuperIO fan control succeeds or fails, plus raw
+/// RPM/PWM values so wrong readings can be traced to the register level.
+pub fn run_diagnostics() {
+    eprintln!("═══ FanController Windows diagnostics ═══");
+    eprintln!("Embedded WinRing0 driver size: {} bytes (need > 10000)", WINRING0_DRIVER.len());
+
+    let ring0 = match Ring0::open() {
+        Some(r) => r,
+        None => {
+            eprintln!("RESULT: WinRing0 driver could not be opened → no direct fan control.");
+            eprintln!("  • Are you running as Administrator?");
+            eprintln!("  • Win11: disable Core Isolation → Memory Integrity, or install LibreHardwareMonitor.");
+            return;
+        }
+    };
+
+    // Probe both SIO ports and report every chip ID seen, even unsupported ones.
+    for &port in &SIO_PORTS {
+        ring0.write_byte(port, 0x87);
+        ring0.write_byte(port, 0x87);
+        let id = SuperIoChip::sio_read_id(&ring0, port);
+        ring0.write_byte(port, 0xAA);
+        eprintln!("Port 0x{port:02X}: raw chip ID = 0x{id:04X} (family nibble 0x{:04X})", id & 0xFFF0);
+    }
+
+    match SuperIoChip::detect(&ring0) {
+        None => {
+            eprintln!("RESULT: driver works but no SUPPORTED SuperIO chip matched.");
+            eprintln!("  Send the raw chip IDs above so the chip can be added.");
+        }
+        Some(chip) => {
+            eprintln!("RESULT: detected {} (family {:?}) at IOBASE 0x{:04X}, {} fan headers.",
+                chip.chip_name, chip.family, chip.iobase, chip.fan_count);
+            let backend = SystemFanBackend { ring0: Some(ring0), chip: Some(chip.clone()), saved_modes: Vec::new() };
+            for i in 0..chip.fan_count {
+                let rpm = backend.read_rpm(i);
+                let pwm = backend.read_pwm(i);
+                eprintln!("  Fan {i}: RPM={rpm:?}  PWM={pwm:?}%");
+            }
+            eprintln!("If RPM/PWM look wrong (all 0, all 100, or absurd), the register map for this chip needs adjusting.");
+        }
+    }
+    eprintln!("════════════════════════════════════════");
 }
 
 impl FanBackend for SystemFanBackend {

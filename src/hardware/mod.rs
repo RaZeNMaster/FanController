@@ -5,7 +5,7 @@ mod types;
 mod linux;
 
 #[cfg(target_os = "windows")]
-mod windows;
+pub mod windows;
 
 pub use controller::FanController;
 pub use types::{FanInfo, FanType, CurvePoint, FanMode};

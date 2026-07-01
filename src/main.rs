@@ -42,6 +42,13 @@ fn main() -> anyhow::Result<()> {
         setup_permissions();
     }
 
+    // Windows: hardware diagnostics mode — run elevated `fancontroller.exe --diag`.
+    #[cfg(target_os = "windows")]
+    if std::env::args().any(|a| a == "--diag") {
+        hardware::windows::run_diagnostics();
+        return Ok(());
+    }
+
     // Windows: install WinRing0 driver if not present (requires admin, asks via UAC).
     #[cfg(target_os = "windows")]
     maybe_install_driver();
