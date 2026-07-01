@@ -243,6 +243,10 @@ struct SuperIoChip {
     sio_port: u16,   // 0x2E or 0x4E
     iobase:   u16,   // hardware monitor base I/O address
     fan_count: usize,
+    /// NCT6779D and newer (chip family ≥ 0xC56x) use a completely different
+    /// register map (13-bit fan-count regs 0x4Bx, PWM regs 0x0xx/0xA09/0xB09)
+    /// than the legacy NCT6775/6776/W836xx count-register scheme.
+    modern: bool,
 }
 
 impl SuperIoChip {
@@ -293,7 +297,7 @@ impl SuperIoChip {
             if iobase < 0x100 { return None; }
             return Some(SuperIoChip {
                 family: ChipFamily::Nct6687, chip_id, chip_name: "NCT6687D",
-                sio_port: port, iobase, fan_count: 8,
+                sio_port: port, iobase, fan_count: 8, modern: true,
             });
         }
 
@@ -325,7 +329,9 @@ impl SuperIoChip {
 
         if iobase < 0x100 { return None; }
 
-        Some(SuperIoChip { family: ChipFamily::Nuvoton, chip_id, chip_name: name, sio_port: port, iobase, fan_count })
+        // NCT6779D (0xC56x) and newer use the modern register map.
+        let modern = (chip_id & 0xFFF0) >= 0xC560;
+        Some(SuperIoChip { family: ChipFamily::Nuvoton, chip_id, chip_name: name, sio_port: port, iobase, fan_count, modern })
     }
 
     // ── ITE IT87xx ────────────────────────────────────────────────────────
@@ -367,7 +373,7 @@ impl SuperIoChip {
 
         if iobase < 0x100 { return None; }
 
-        Some(SuperIoChip { family: ChipFamily::Ite, chip_id, chip_name: name, sio_port: port, iobase, fan_count })
+        Some(SuperIoChip { family: ChipFamily::Ite, chip_id, chip_name: name, sio_port: port, iobase, fan_count, modern: false })
     }
 
     // ── Fintek F71xxx ─────────────────────────────────────────────────────
@@ -402,7 +408,7 @@ impl SuperIoChip {
 
         if iobase < 0x100 { return None; }
 
-        Some(SuperIoChip { family: ChipFamily::Fintek, chip_id, chip_name: name, sio_port: port, iobase, fan_count })
+        Some(SuperIoChip { family: ChipFamily::Fintek, chip_id, chip_name: name, sio_port: port, iobase, fan_count, modern: false })
     }
 
     // ── SIO helper: read 16-bit chip ID ──────────────────────────────────
@@ -461,37 +467,91 @@ impl Nuvoton {
         r.write_byte(iobase + Self::DAT, val);
     }
 
-    /// Fan RPM from 12-bit counter (bank 0, regs 0x28-0x33).
-    fn read_rpm(r: &Ring0, iobase: u16, fan: usize) -> Option<u32> {
-        let hi_reg = 0x28u8 + (fan as u8) * 2;
-        let lo_reg = hi_reg + 1;
-        let hi = Self::read_reg(r, iobase, 0, hi_reg)? as u32;
-        let lo = Self::read_reg(r, iobase, 0, lo_reg)? as u32;
-        let count = (hi << 8) | lo;
-        if count == 0 || count == 0xFFFF { Some(0) }
-        else { Some(1_350_000 / count) }
+    // ── Modern NCT6779D+ register map (16-bit addresses) ────────────────────
+    // A 16-bit address ABCD selects bank 0xAB (written to index reg 0x4E) and
+    // register 0xCD. Layout taken from LibreHardwareMonitor (Nct677X.cs).
+    const M_FAN_COUNT: [u16; 7] = [0x4B0, 0x4B2, 0x4B4, 0x4B6, 0x4B8, 0x4BA, 0x4CC];
+    const M_PWM_OUT:   [u16; 7] = [0x001, 0x003, 0x011, 0x013, 0x015, 0xA09, 0xB09];
+    const M_PWM_CMD:   [u16; 7] = [0x109, 0x209, 0x309, 0x809, 0x909, 0xA09, 0xB09];
+    const M_CTRL_MODE: [u16; 7] = [0x102, 0x202, 0x302, 0x802, 0x902, 0xA02, 0xB02];
+    const M_MAX_COUNT: u32 = 0x1FFF; // 13-bit counter
+    const M_MIN_COUNT: u32 = 0x15;
+
+    fn read_addr(r: &Ring0, iobase: u16, addr: u16) -> Option<u8> {
+        Self::read_reg(r, iobase, (addr >> 8) as u8, (addr & 0xFF) as u8)
     }
 
-    /// Current PWM % (bank = fan+1, reg 0x09 = PWM output, 0–255 → 0–100%).
-    fn read_pwm(r: &Ring0, iobase: u16, fan: usize) -> Option<u8> {
-        let bank = (fan + 1) as u8;
-        let raw = Self::read_reg(r, iobase, bank, 0x09)?;
+    fn write_addr(r: &Ring0, iobase: u16, addr: u16, val: u8) {
+        Self::write_reg(r, iobase, (addr >> 8) as u8, (addr & 0xFF) as u8, val);
+    }
+
+    /// Fan RPM. Legacy chips use a 12-bit counter at bank 0 regs 0x28-0x33;
+    /// NCT6779D+ uses 13-bit counters at the 0x4Bx/0x4CC addresses.
+    fn read_rpm(r: &Ring0, iobase: u16, fan: usize, modern: bool) -> Option<u32> {
+        if modern {
+            let addr = *Self::M_FAN_COUNT.get(fan)?;
+            let hi = Self::read_addr(r, iobase, addr)? as u32;
+            let lo = Self::read_addr(r, iobase, addr + 1)? as u32;
+            // 13-bit count: high byte = bits 12..5, low byte = bits 4..0.
+            let count = (hi << 5) | (lo & 0x1F);
+            if count >= Self::M_MAX_COUNT || count < Self::M_MIN_COUNT { Some(0) }
+            else { Some(1_350_000 / count) }
+        } else {
+            let hi_reg = 0x28u8 + (fan as u8) * 2;
+            let hi = Self::read_reg(r, iobase, 0, hi_reg)? as u32;
+            let lo = Self::read_reg(r, iobase, 0, hi_reg + 1)? as u32;
+            let count = (hi << 8) | lo;
+            if count == 0 || count == 0xFFFF { Some(0) }
+            else { Some(1_350_000 / count) }
+        }
+    }
+
+    /// Current PWM output as 0–100 %.
+    fn read_pwm(r: &Ring0, iobase: u16, fan: usize, modern: bool) -> Option<u8> {
+        let raw = if modern {
+            Self::read_addr(r, iobase, *Self::M_PWM_OUT.get(fan)?)?
+        } else {
+            Self::read_reg(r, iobase, (fan + 1) as u8, 0x09)?
+        };
         Some((raw as u32 * 100 / 255) as u8)
     }
 
-    /// Set PWM to pct % and switch fan to manual duty-cycle mode.
-    fn set_pwm(r: &Ring0, iobase: u16, fan: usize, pct: u8) {
-        let bank = (fan + 1) as u8;
-        let raw = (pct as u32 * 255 / 100).min(255) as u8;
-        // Mode register 0x02: 0x00 = manual duty-cycle (Smart FAN IV off)
-        Self::write_reg(r, iobase, bank, 0x02, 0x00);
-        Self::write_reg(r, iobase, bank, 0x09, raw);
+    /// Read the raw fan-control-mode register (used to save the BIOS default
+    /// before switching a fan to manual mode). Modern chips only.
+    fn read_ctrl_mode(r: &Ring0, iobase: u16, fan: usize) -> Option<u8> {
+        Self::read_addr(r, iobase, *Self::M_CTRL_MODE.get(fan)?)
     }
 
-    /// Restore Smart Fan IV automatic mode (0x03).
-    fn reset_pwm(r: &Ring0, iobase: u16, fan: usize) {
-        let bank = (fan + 1) as u8;
-        Self::write_reg(r, iobase, bank, 0x02, 0x03); // 0x03 = Smart Fan IV
+    /// Set PWM to pct % and switch fan to manual duty-cycle mode.
+    fn set_pwm(r: &Ring0, iobase: u16, fan: usize, pct: u8, modern: bool) {
+        let raw = (pct as u32 * 255 / 100).min(255) as u8;
+        if modern {
+            if let (Some(&mode_addr), Some(&cmd_addr)) =
+                (Self::M_CTRL_MODE.get(fan), Self::M_PWM_CMD.get(fan))
+            {
+                Self::write_addr(r, iobase, mode_addr, 0x00); // 0 = manual mode
+                Self::write_addr(r, iobase, cmd_addr, raw);
+            }
+        } else {
+            let bank = (fan + 1) as u8;
+            Self::write_reg(r, iobase, bank, 0x02, 0x00);
+            Self::write_reg(r, iobase, bank, 0x09, raw);
+        }
+    }
+
+    /// Hand the fan back to automatic control. `restore` is the fan-control-mode
+    /// byte captured before the first manual write (BIOS/SmartFan default).
+    fn reset_pwm(r: &Ring0, iobase: u16, fan: usize, modern: bool, restore: Option<u8>) {
+        if modern {
+            if let Some(&mode_addr) = Self::M_CTRL_MODE.get(fan) {
+                // Restore the saved default; fall back to SmartFan mode (0x04)
+                // if nothing was captured (never controlled this session).
+                Self::write_addr(r, iobase, mode_addr, restore.unwrap_or(0x04));
+            }
+        } else {
+            let bank = (fan + 1) as u8;
+            Self::write_reg(r, iobase, bank, 0x02, restore.unwrap_or(0x03));
+        }
     }
 }
 
@@ -674,7 +734,9 @@ impl Nct6687 {
 pub struct SystemFanBackend {
     ring0: Option<Ring0>,
     chip:  Option<SuperIoChip>,
-    saved_modes: Vec<u8>,
+    /// BIOS/SmartFan control-mode byte per fan index, captured before the first
+    /// manual write so `reset_to_auto` can hand the fan back to the firmware.
+    saved_modes: std::collections::HashMap<usize, u8>,
 }
 
 impl SystemFanBackend {
@@ -691,8 +753,7 @@ impl SystemFanBackend {
     pub fn new() -> Self {
         let ring0 = Ring0::open();
         let chip = ring0.as_ref().and_then(SuperIoChip::detect);
-        let saved_modes = Vec::new();
-        Self { ring0, chip, saved_modes }
+        Self { ring0, chip, saved_modes: std::collections::HashMap::new() }
     }
 
     fn fan_id(fan: usize) -> String { format!("sio:{fan}") }
@@ -706,7 +767,7 @@ impl SystemFanBackend {
         let r = self.ring0.as_ref()?;
         let c = self.chip.as_ref()?;
         match c.family {
-            ChipFamily::Nuvoton => Nuvoton::read_rpm(r, c.iobase, fan),
+            ChipFamily::Nuvoton => Nuvoton::read_rpm(r, c.iobase, fan, c.modern),
             ChipFamily::Nct6687 => Nct6687::read_rpm(r, c.iobase, fan),
             ChipFamily::Ite     => Ite::read_rpm(r, c.iobase, fan),
             ChipFamily::Fintek  => Fintek::read_rpm(r, c.iobase, fan),
@@ -717,7 +778,7 @@ impl SystemFanBackend {
         let r = self.ring0.as_ref()?;
         let c = self.chip.as_ref()?;
         match c.family {
-            ChipFamily::Nuvoton => Nuvoton::read_pwm(r, c.iobase, fan),
+            ChipFamily::Nuvoton => Nuvoton::read_pwm(r, c.iobase, fan, c.modern),
             ChipFamily::Nct6687 => Nct6687::read_pwm(r, c.iobase, fan),
             ChipFamily::Ite     => Ite::read_pwm(r, c.iobase, fan),
             ChipFamily::Fintek  => Fintek::read_pwm(r, c.iobase, fan),
@@ -760,7 +821,7 @@ pub fn run_diagnostics() {
         Some(chip) => {
             eprintln!("RESULT: detected {} (family {:?}) at IOBASE 0x{:04X}, {} fan headers.",
                 chip.chip_name, chip.family, chip.iobase, chip.fan_count);
-            let backend = SystemFanBackend { ring0: Some(ring0), chip: Some(chip.clone()), saved_modes: Vec::new() };
+            let backend = SystemFanBackend { ring0: Some(ring0), chip: Some(chip.clone()), saved_modes: std::collections::HashMap::new() };
             for i in 0..chip.fan_count {
                 let rpm = backend.read_rpm(i);
                 let pwm = backend.read_pwm(i);
@@ -824,12 +885,20 @@ impl FanBackend for SystemFanBackend {
         let fan: usize = fan_id.trim_start_matches("sio:").parse()?;
         let r = self.ring0.as_ref().ok_or_else(|| anyhow::anyhow!("WinRing0 driver not available"))?;
         let c = self.chip.as_ref().ok_or_else(|| anyhow::anyhow!("No SuperIO chip detected"))?;
+        let (family, iobase, modern) = (c.family, c.iobase, c.modern);
         let pct = pct.max(20); // safety floor
-        match c.family {
-            ChipFamily::Nuvoton => Nuvoton::set_pwm(r, c.iobase, fan, pct),
-            ChipFamily::Nct6687 => Nct6687::set_pwm(r, c.iobase, fan, pct),
-            ChipFamily::Ite     => Ite::set_pwm(r, c.iobase, fan, pct),
-            ChipFamily::Fintek  => Fintek::set_pwm(r, c.iobase, fan, pct),
+        // Capture the BIOS/SmartFan control-mode byte once, before overriding it,
+        // so reset_to_auto can hand the fan back to the firmware (modern Nuvoton).
+        if family == ChipFamily::Nuvoton && modern && !self.saved_modes.contains_key(&fan) {
+            if let Some(m) = Nuvoton::read_ctrl_mode(r, iobase, fan) {
+                self.saved_modes.insert(fan, m);
+            }
+        }
+        match family {
+            ChipFamily::Nuvoton => Nuvoton::set_pwm(r, iobase, fan, pct, modern),
+            ChipFamily::Nct6687 => Nct6687::set_pwm(r, iobase, fan, pct),
+            ChipFamily::Ite     => Ite::set_pwm(r, iobase, fan, pct),
+            ChipFamily::Fintek  => Fintek::set_pwm(r, iobase, fan, pct),
         }
         Ok(())
     }
@@ -839,12 +908,15 @@ impl FanBackend for SystemFanBackend {
         let fan: usize = fan_id.trim_start_matches("sio:").parse()?;
         let r = self.ring0.as_ref().ok_or_else(|| anyhow::anyhow!("WinRing0 driver not available"))?;
         let c = self.chip.as_ref().ok_or_else(|| anyhow::anyhow!("No SuperIO chip detected"))?;
-        match c.family {
-            ChipFamily::Nuvoton => Nuvoton::reset_pwm(r, c.iobase, fan),
-            ChipFamily::Nct6687 => Nct6687::reset_pwm(r, c.iobase, fan),
-            ChipFamily::Ite     => Ite::reset_pwm(r, c.iobase, fan),
-            ChipFamily::Fintek  => Fintek::reset_pwm(r, c.iobase, fan),
+        let (family, iobase, modern) = (c.family, c.iobase, c.modern);
+        let restore = self.saved_modes.get(&fan).copied();
+        match family {
+            ChipFamily::Nuvoton => Nuvoton::reset_pwm(r, iobase, fan, modern, restore),
+            ChipFamily::Nct6687 => Nct6687::reset_pwm(r, iobase, fan),
+            ChipFamily::Ite     => Ite::reset_pwm(r, iobase, fan),
+            ChipFamily::Fintek  => Fintek::reset_pwm(r, iobase, fan),
         }
+        self.saved_modes.remove(&fan);
         Ok(())
     }
 }
