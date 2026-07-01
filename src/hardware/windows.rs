@@ -1058,10 +1058,16 @@ impl FanBackend for WmiBackend {
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 
-pub struct NvidiaBackend { nvml: Option<Nvml> }
+pub struct NvidiaBackend {
+    nvml: Option<Nvml>,
+    // Private NVAPI for actual fan control (NVML control is blocked on Windows).
+    nvapi: Option<crate::hardware::nvapi::NvApi>,
+}
 
 impl NvidiaBackend {
-    pub fn new() -> Self { Self { nvml: Nvml::init().ok() } }
+    pub fn new() -> Self {
+        Self { nvml: Nvml::init().ok(), nvapi: crate::hardware::nvapi::NvApi::new() }
+    }
 
     fn parse_id(fan_id: &str) -> anyhow::Result<(u32, u32)> {
         if !fan_id.starts_with("nvidia:") { anyhow::bail!("not nvidia"); }
@@ -1099,28 +1105,19 @@ impl FanBackend for NvidiaBackend {
     }
 
     fn set_speed_pct(&mut self, fan_id: &str, pct: u8) -> anyhow::Result<()> {
-        let (g, f) = Self::parse_id(fan_id)?;
-        let nvml = self.nvml.as_ref().ok_or_else(|| anyhow::anyhow!("NVML unavailable"))?;
-        let mut dev = nvml.device_by_index(g)?;
-        dev.set_fan_speed(f, pct.clamp(30, 100) as u32).map_err(|e| match e {
-            // Consumer GeForce drivers reject programmatic fan control through the
-            // public NVML API on Windows (even elevated). Give a clear message
-            // instead of the raw "no permission" error.
-            nvml_wrapper::error::NvmlError::NoPermission =>
-                anyhow::anyhow!("GPU-Lüftersteuerung ist unter Windows über NVML nicht möglich \
-                    (NVIDIA-Consumer-Treiber verweigern es, auch als Administrator). \
-                    Nutze dafür z. B. MSI Afterburner. Mainboard-Lüfter lassen sich hier steuern."),
-            other => anyhow::anyhow!("GPU-Lüfter konnte nicht gesetzt werden: {other}"),
-        })?;
-        Ok(())
+        let (g, _f) = Self::parse_id(fan_id)?;
+        // Control via private NVAPI (public NVML control is blocked on Windows).
+        let api = self.nvapi.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "NVAPI nicht verfügbar (nvapi64.dll fehlt oder keine NVIDIA-GPU). \
+             GPU-Lüftersteuerung ist unter Windows nur über NVAPI möglich."))?;
+        api.set_fans(g as usize, Some(pct.clamp(30, 100)))
     }
 
     fn reset_to_auto(&mut self, fan_id: &str) -> anyhow::Result<()> {
         let (g, _) = Self::parse_id(fan_id)?;
-        let nvml = self.nvml.as_ref().ok_or_else(|| anyhow::anyhow!("NVML unavailable"))?;
-        let mut dev = nvml.device_by_index(g)?;
-        for f in 0..dev.num_fans().unwrap_or(1).max(1) { let _ = dev.set_default_fan_speed(f); }
-        Ok(())
+        let api = self.nvapi.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "NVAPI nicht verfügbar — GPU-Lüfter können nicht zurückgesetzt werden."))?;
+        api.set_fans(g as usize, None)
     }
 }
 
