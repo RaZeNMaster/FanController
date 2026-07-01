@@ -1,0 +1,56 @@
+[package]
+name = "fancontroller"
+version = "0.1.0"
+edition = "2021"
+description = "Fan controller for Windows and Linux with a native HTML GUI"
+authors = ["Smokey-thc"]
+license = "MIT"
+repository = "https://github.com/Smokey-thc/FanController"
+
+[[bin]]
+name = "fancontroller"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+
+# Cross-platform window + WebView
+# On Linux: uses WebKit2GTK internally
+# On Windows: uses Edge WebView2 (built into Windows 10/11)
+tao = "0.28"
+wry = "0.38"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# IPC between Rust and HTML frontend
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nvml-wrapper = "0.12.1"
+glob = "0.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# NVML for NVIDIA GPU fan control
+nvml-wrapper = "0.12.1"
+# WMI for system fan reading via LibreHardwareMonitor
+wmi = "0.14"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_System_Wmi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Dynamic loading of AMD ADL (atiadlxx.dll from AMD driver)
+libloading = "0.8"
+
+[profile.release]
+strip = true
+lto = true
